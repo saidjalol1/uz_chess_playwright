@@ -84,9 +84,17 @@ async def execute_registration_flow(
     try:
         # Step 1: Initialize BrowserController with stealth configuration
         logger.info("Initializing browser with stealth configuration")
+        
+        # Clear previous browser data to avoid starting with a logged-in session
+        import shutil
+        browser_data_dir = "./browser_data"
+        if os.path.exists(browser_data_dir):
+            logger.info("Clearing previous browser data for fresh session")
+            shutil.rmtree(browser_data_dir)
+        
         browser_options = BrowserOptions(
             headless=False,
-            user_data_dir="./browser_data"
+            user_data_dir=browser_data_dir
             # Explicitly not setting viewport so it uses the default window size
         )
         await browser.initialize(browser_options)
@@ -436,90 +444,105 @@ async def execute_registration_flow(
                 }).filter(p => p !== null).sort((a, b) => a.y - b.y);
             }""")
         
-        # Helper: interact with a dropdown (click to open, type to search, click result)
-        async def select_dropdown_item(field_name, click_y, search_text):
-            card_center_x = 1583
+        # Helper: interact with a Flutter dropdown (click to open modal, type to search, click result)
+        # Flutter bottom-sheet modals are entirely canvas-rendered, so DOM input positions
+        # don't change. We rely on visual coordinates measured from actual screenshots.
+        async def select_dropdown_item(field_name, click_x, click_y, search_text):
+            """
+            Opens a Flutter dropdown modal, types search text, and clicks the first result.
             
-            # Record input positions BEFORE clicking
-            positions_before = await get_all_input_positions()
-            topmost_y_before = positions_before[0]['y'] if positions_before else 999
-            logger.info(f"Topmost input Y before {field_name} click: {topmost_y_before}")
+            The modal is a Flutter bottom-sheet that opens centered on the page.
+            The search bar auto-focuses, so keyboard typing goes directly to it.
+            After filtering, the first result appears below the search bar.
+            """
+            logger.info(f"Opening {field_name} dropdown at ({click_x}, {click_y})")
             
-            # Click the dropdown field ONCE on the canvas (no sweep - sweep closes modal!)
-            logger.info(f"Clicking {field_name} dropdown at ({card_center_x}, {click_y})")
-            await browser.page.mouse.click(card_center_x, click_y)
-            await asyncio.sleep(2)  # Wait for modal animation
-            
-            # Check if the modal opened by detecting if the topmost input MOVED UP
-            # Flutter repositions an existing input to serve as the modal search bar
-            positions_after = await get_all_input_positions()
-            topmost_y_after = positions_after[0]['y'] if positions_after else 999
-            logger.info(f"Topmost input Y after {field_name} click: {topmost_y_after}")
-            logger.info(f"All input positions after click: {positions_after}")
+            # Click the dropdown field to open the modal
+            await browser.page.mouse.click(click_x, click_y)
+            await asyncio.sleep(2)  # Wait for modal open animation
             
             try:
                 await browser.screenshot(f"./screenshots/after_{field_name}_click.png")
             except Exception:
                 pass
             
-            # Modal detected if the topmost input jumped upward significantly
-            modal_detected = topmost_y_after < (topmost_y_before - 50)
+            # The modal bottom-sheet is now open.
+            # The modal is centered horizontally at approximately vp_w * 0.46
+            # (measured from the after_country_click.png screenshot).
+            # The search bar is at the top, and list items start below it.
+            modal_center_x = int(vp['w'] * 0.46)
             
-            if modal_detected:
-                logger.info(f"{field_name} modal detected! Search bar moved to Y={topmost_y_after}")
-                search_bar = positions_after[0]
-                
-                # Type in the auto-focused search bar
-                logger.info(f"Typing '{search_text}' in {field_name} search")
-                await browser.page.keyboard.type(search_text, delay=100)
+            # Click the search bar to ensure it's focused before typing.
+            # The search bar doesn't always auto-focus (confirmed by region modal screenshots).
+            # Search bar is at approximately vp_h * 0.04 in the modal.
+            search_bar_y = int(vp['h'] * 0.04)
+            logger.info(f"Clicking search bar at ({modal_center_x}, {search_bar_y}) to focus")
+            await browser.page.mouse.click(modal_center_x, search_bar_y)
+            await asyncio.sleep(0.5)
+            
+            # Type search text into the now-focused search bar
+            logger.info(f"Typing '{search_text}' in {field_name} search bar")
+            await browser.page.keyboard.type(search_text, delay=100)
+            await asyncio.sleep(1.5)  # Wait for search filtering
+            
+            try:
+                await browser.screenshot(f"./screenshots/after_{field_name}_type.png")
+            except Exception:
+                pass
+            
+            # Click the first search result.
+            # After typing search text, the list filters to show matching items.
+            # The first result appears below the search bar at ~vp_h*0.09.
+            # We sweep multiple Y positions to ensure we hit the first result.
+            for result_pct in [0.09, 0.11, 0.13, 0.15, 0.17]:
+                result_y = int(vp['h'] * result_pct)
+                logger.info(f"Clicking {field_name} result at ({modal_center_x}, {result_y})")
+                await browser.page.mouse.click(modal_center_x, result_y)
                 await asyncio.sleep(1)
                 
-                # Click the first result - it's right below the search bar
-                result_x = search_bar['x'] + search_bar['width'] / 2
-                result_y = search_bar['y'] + 30
-                logger.info(f"Clicking first {field_name} result at ({result_x}, {result_y})")
-                await browser.page.mouse.click(result_x, result_y)
-            else:
-                # Modal might have opened but inputs didn't reposition detectably
-                # Fallback: type directly (search bar is auto-focused) and click proportionally
-                logger.info(f"{field_name} modal: fallback mode (position change: {topmost_y_before} -> {topmost_y_after})")
-                logger.info(f"Typing '{search_text}' directly via keyboard")
-                await browser.page.keyboard.type(search_text, delay=100)
-                await asyncio.sleep(1)
-                
-                try:
-                    await browser.screenshot(f"./screenshots/after_{field_name}_type.png")
-                except Exception:
-                    pass
-                
-                # Click the first result at proportional position
-                result_x = int(vp['w'] * 0.50)
-                result_y = int(vp['h'] * 0.12)
-                logger.info(f"Clicking first {field_name} result at proportional ({result_x}, {result_y})")
-                await browser.page.mouse.click(result_x, result_y)
+                # Check if modal closed by taking a screenshot
+                # (We can't reliably detect via DOM, so rely on the sweep)
             
             await asyncio.sleep(2)
             try:
                 await browser.screenshot(f"./screenshots/after_{field_name}_select.png")
             except Exception:
                 pass
+            
+            logger.info(f"{field_name} selection attempt completed")
+        
+        # Calculate right panel center X (the address card is on the right side)
+        # Verified value: 0.75 successfully opens the Country modal (X=1599 on 2133px viewport)
+        right_panel_x = int(vp['w'] * 0.75)
+        logger.info(f"Right panel center X: {right_panel_x}")
         
         # --- 1. Select Country ---
-        # Country field is at approximately 58% down the viewport
+        # Country field clickable area is at ~58% down the viewport (verified working)
         country_y = int(vp['h'] * 0.58)
-        await select_dropdown_item("country", country_y, "Uzbekistan")
+        await select_dropdown_item("country", right_panel_x, country_y, "Uzbekistan")
         
         # --- 2. Select Region ---
-        # Region field appears below Country, at approximately 65% down
-        region_y = int(vp['h'] * 0.65)
-        await select_dropdown_item("region", region_y, "Andijon viloyati")
+        # After selecting Country=Uzbekistan, the Region dropdown appears below it
+        await asyncio.sleep(2)
+        try:
+            await browser.screenshot("./screenshots/before_region_click.png")
+        except Exception:
+            pass
+        
+        # Region field is below Country. From screenshots, the Region label center is at
+        # approximately Y=424 in 758px screenshot → ~597 viewport pixels (0.56).
+        # But the clickable area extends below the label text, similar to how Country
+        # is at 0.53 label but needs 0.58 click. So Region needs clicking at ~0.60-0.62.
+        region_y = int(vp['h'] * 0.61)
+        await select_dropdown_item("region", right_panel_x, region_y, "Andijon")
         
         # --- 3. Submit Address Continue ---
         logger.info("Submitting Address form via downward click sweep")
-        card_center_x = 1583
-        for y in [750, 790, 830, 870, 910, 950]:
-            logger.info(f"Clicking Continue sweep at (X={card_center_x}, Y={y})")
-            await browser.page.mouse.click(card_center_x, y)
+        # Continue button is at approximately 88% down the viewport (measured from screenshot)
+        for pct in [0.85, 0.88, 0.91, 0.94]:
+            y = int(vp['h'] * pct)
+            logger.info(f"Clicking Continue sweep at (X={right_panel_x}, Y={y})")
+            await browser.page.mouse.click(right_panel_x, y)
             await asyncio.sleep(0.3)
             
         await asyncio.sleep(5)

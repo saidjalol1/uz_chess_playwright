@@ -52,17 +52,22 @@ class BrowserController:
         # Using launch_persistent_context instead of new_context for better stealth
         await self.browser.close()  # Close the initial browser
         
+        args = [
+            '--disable-blink-features=AutomationControlled',
+        ]
+        # Start maximized if not in headless mode
+        if not options.headless:
+            args.append('--start-maximized')
+            
         self.browser = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=options.user_data_dir,
             headless=options.headless,
             viewport=options.viewport,
-            no_viewport=options.viewport is None,
+            no_viewport=True,  # Set to True so viewport stretches to 100% of window
             # Set realistic user agent (remove automation indicators)
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             # Disable automation flags
-            args=[
-                '--disable-blink-features=AutomationControlled',
-            ],
+            args=args,
             # Additional stealth settings
             ignore_default_args=['--enable-automation'],
         )
